@@ -1,0 +1,32 @@
+[project]
+name = "llm-system-benchmarks"
+version = "0.1.0"
+description = "Benchmarking suite for LLM systems and internals - analyzing preprocessing bottlenecks, GIL constraints, and optimization strategies"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=2.2.6",
+    "pandas>=2.3.3",
+    "psutil>=7.2.2",
+    "seaborn>=0.13.2",
+    "tiktoken>=0.12.0",
+    "torch>=2.10.0",
+    "transformers>=5.0.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0.0",
+    "ruff>=0.4.0",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = "test_*.py"

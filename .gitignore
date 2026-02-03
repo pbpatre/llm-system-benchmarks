@@ -1,3 +1,9 @@
+# Benchmark outputs (regenerate with: uv run python -m preprocessing.benchmarks.run)
+output/
+
+# macOS
+.DS_Store
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
