@@ -1,4 +1,6 @@
 import argparse
+import os
+
 import numpy as np
 import seaborn as sns
 import matplotlib.pyplot as plt
@@ -102,7 +104,9 @@ def plot_heatmap(naive_grid, packed_grid):
     axes[1].set_xlabel("Context Length (4096)", fontsize=12)
 
     plt.tight_layout()
-    output_file = "padding_tax_heatmap.png"
+    output_dir = "./output"
+    os.makedirs(output_dir, exist_ok=True)
+    output_file = os.path.join(output_dir, "padding_tax_heatmap.png")
     plt.savefig(output_file)
     print(f"✅ Saved visualization to {output_file}")
 

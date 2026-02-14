@@ -77,6 +77,8 @@ def purge_os_cache():
     Attempt to flush the OS page cache so benchmarks hit real storage.
     - macOS: `sudo purge`  (tries both non-interactive and interactive)
     - Linux: `sync && echo 3 > /proc/sys/vm/drop_caches`
+      Tries direct write first (works when already root, e.g. in containers),
+      then falls back to sudo.
     Returns True if successful, False otherwise.
     """
     system = platform.system()
@@ -95,6 +97,15 @@ def purge_os_cache():
             return result.returncode == 0
         elif system == "Linux":
             subprocess.run(["sync"], check=True, capture_output=True)
+            # Try direct write first (works when running as root, e.g. in
+            # Docker/Kubernetes containers without sudo installed).
+            try:
+                with open("/proc/sys/vm/drop_caches", "w") as f:
+                    f.write("3\n")
+                return True
+            except (PermissionError, OSError):
+                pass
+            # Fall back to sudo
             result = subprocess.run(
                 ["sudo", "-n", "sh", "-c",
                  "echo 3 > /proc/sys/vm/drop_caches"],

@@ -7,21 +7,23 @@ import torch
 import torch.utils.data
 from io_benchmark_utils import (
     DEFAULT_DATA_DIR,
-    DEFAULT_NUM_SAMPLES,
-    DEFAULT_SAMPLE_SIZE_KB,
     cleanup_data,
     count_samples,
     data_exists,
     detect_sample_size,
+    purge_os_cache,
     setup_data,
 )
 from torch.utils.data import DataLoader, Dataset
 
-# Defaults
+# Defaults — tuned for starker results than the shared utils defaults.
+# More files + smaller samples = per-file overhead dominates read time.
+DEFAULT_NUM_SAMPLES = 50_000
+DEFAULT_SAMPLE_SIZE_KB = 4       # 4KB each → ~200MB total
 DEFAULT_BATCH_SIZE = 64
 DEFAULT_NUM_WORKERS = 4
-DEFAULT_NUM_RUNS = 3
-DEFAULT_WARMUP_BATCHES = 5
+DEFAULT_NUM_RUNS = 5
+DEFAULT_WARMUP_BATCHES = 2
 
 
 class SmallFilesDataset(Dataset):
@@ -82,15 +84,25 @@ def giant_file_worker_init(worker_id):
     dataset._fh = open(dataset.file_path, "rb")
 
 
-def benchmark_loader(loader, label, num_runs, warmup_batches):
-    """Run the loader multiple times, report mean +/- std throughput."""
+def benchmark_loader(loader, label, num_runs, warmup_batches,
+                     purge_cache=True):
+    """Run the loader multiple times, report mean +/- std throughput.
+
+    When purge_cache is True, the OS page cache is flushed before each run
+    so every measurement hits real storage rather than RAM.
+    """
     speeds = []
 
     for run in range(1, num_runs + 1):
+        # Flush OS page cache so every run starts from cold storage.
+        if purge_cache:
+            purge_os_cache()
+
         total_bytes = 0
         iterator = iter(loader)
 
-        # Warmup — let workers spin up, caches settle
+        # Warmup — let workers spin up (but cache is cold, so I/O
+        # pattern differences remain visible).
         for _ in range(warmup_batches):
             try:
                 next(iterator)
@@ -114,14 +126,16 @@ def benchmark_loader(loader, label, num_runs, warmup_batches):
 
     mean_speed = statistics.mean(speeds)
     std_speed = statistics.stdev(speeds) if len(speeds) > 1 else 0.0
+    cache_note = "cold" if purge_cache else "warm"
     print(f"   {label}")
     print(f"     Speed: {mean_speed:>8.2f} ± {std_speed:.2f} MB/s "
-          f"({num_runs} runs, {warmup_batches} warmup batches)")
+          f"({num_runs} runs, {warmup_batches} warmup batches, {cache_note} cache)")
     return mean_speed
 
 
 def run_scenario(data_dir, giant_file_path, sample_size_bytes, num_samples,
-                 num_workers, batch_size, num_runs, warmup_batches):
+                 num_workers, batch_size, num_runs, warmup_batches,
+                 purge_cache=True):
     """Run random vs sequential benchmark for a given worker count."""
     worker_label = f"num_workers={num_workers}"
     if num_workers == 0:
@@ -129,9 +143,10 @@ def run_scenario(data_dir, giant_file_path, sample_size_bytes, num_samples,
     else:
         worker_label += " (parallel prefetch — masks I/O pattern)"
 
-    print(f"{'─' * 55}")
-    print(f"  Scenario: {worker_label}")
-    print(f"{'─' * 55}")
+    cache_label = "cold cache (purged)" if purge_cache else "warm cache"
+    print(f"{'─' * 60}")
+    print(f"  Scenario: {worker_label}  [{cache_label}]")
+    print(f"{'─' * 60}")
 
     # --- Small Files (Random Access) ---
     print("\n  🐢 Random Access — many small files, shuffled:")
@@ -141,10 +156,11 @@ def run_scenario(data_dir, giant_file_path, sample_size_bytes, num_samples,
         batch_size=batch_size,
         num_workers=num_workers,
         shuffle=True,
+        persistent_workers=num_workers > 0,
     )
     rand_speed = benchmark_loader(
         loader_small, "Small Files (open/read/close per sample)",
-        num_runs, warmup_batches
+        num_runs, warmup_batches, purge_cache=purge_cache
     )
 
     # --- Giant File (Sequential Access) ---
@@ -157,10 +173,11 @@ def run_scenario(data_dir, giant_file_path, sample_size_bytes, num_samples,
         num_workers=num_workers,
         shuffle=False,
         worker_init_fn=worker_init,
+        persistent_workers=num_workers > 0,
     )
     seq_speed = benchmark_loader(
         loader_giant, "Giant Shard (persistent handle, seek+read)",
-        num_runs, warmup_batches
+        num_runs, warmup_batches, purge_cache=purge_cache
     )
 
     speedup = seq_speed / rand_speed if rand_speed > 0 else float("inf")
@@ -186,10 +203,14 @@ def main():
                         help=f"Benchmark iterations (default: {DEFAULT_NUM_RUNS})")
     parser.add_argument("--warmup", type=int, default=DEFAULT_WARMUP_BATCHES,
                         help=f"Warmup batches per run (default: {DEFAULT_WARMUP_BATCHES})")
+    parser.add_argument("--no-cache-purge", action="store_true",
+                        help="Skip OS cache purge between runs (warm cache — "
+                             "differences will be smaller)")
     parser.add_argument("--keep-data", action="store_true",
                         help="Don't delete benchmark data after finishing")
     args = parser.parse_args()
 
+    purge_cache = not args.no_cache_purge
     sample_size_bytes = args.sample_size_kb * 1024
 
     # Generate data if it doesn't already exist
@@ -204,9 +225,11 @@ def main():
 
     giant_file_path = os.path.join(args.data_dir, "giant_shard.bin")
 
+    total_mb = (num_samples * sample_size_bytes) / (1024 * 1024)
     print("📊 DataLoader I/O Benchmark")
     print(f"   Samples: {num_samples:,}  |  Sample size: {sample_size_bytes // 1024}KB  "
-          f"|  Batch: {args.batch_size}")
+          f"|  Batch: {args.batch_size}  |  Total: ~{total_mb:.0f}MB")
+    print(f"   Cache purge: {'ON — each run starts cold' if purge_cache else 'OFF — warm cache'}")
     print()
 
     # ── Scenario 1: num_workers=0 ──
@@ -215,7 +238,8 @@ def main():
     _, _, speedup_sync = run_scenario(
         args.data_dir, giant_file_path, sample_size_bytes, num_samples,
         num_workers=0, batch_size=args.batch_size,
-        num_runs=args.runs, warmup_batches=args.warmup
+        num_runs=args.runs, warmup_batches=args.warmup,
+        purge_cache=purge_cache,
     )
     print()
 
@@ -225,26 +249,34 @@ def main():
     _, _, speedup_async = run_scenario(
         args.data_dir, giant_file_path, sample_size_bytes, num_samples,
         num_workers=args.num_workers, batch_size=args.batch_size,
-        num_runs=args.runs, warmup_batches=args.warmup
+        num_runs=args.runs, warmup_batches=args.warmup,
+        purge_cache=purge_cache,
     )
     print()
 
     # ── Final Summary ──
-    print(f"{'═' * 55}")
+    print(f"{'═' * 60}")
     print("  SUMMARY")
-    print(f"{'═' * 55}")
+    print(f"{'═' * 60}")
+    cache_note = "cold cache" if purge_cache else "warm cache"
     print(f"  num_workers=0:  {speedup_sync:.1f}x speedup  "
-          "(raw I/O pattern difference)")
+          f"(raw I/O pattern, {cache_note})")
     print(f"  num_workers={args.num_workers}:  {speedup_async:.1f}x speedup  "
-          "(with parallel prefetch)")
-    print(f"{'─' * 55}")
-    if speedup_sync > 2 and speedup_async < 2:
+          f"(parallel prefetch, {cache_note})")
+    print(f"{'─' * 60}")
+    if purge_cache and speedup_sync > 2:
+        print("  Cold-cache results expose the true I/O pattern penalty.")
+        if speedup_async < speedup_sync:
+            print("  Workers partially mask it by prefetching, but the gap persists.")
+        else:
+            print("  Even with workers, sequential access remains faster.")
+    elif speedup_sync > 2 and speedup_async < 2:
         print("  Lesson: Workers mask the I/O difference by prefetching.")
         print("  But on cold storage (HDD/network), the pattern still matters!")
     elif speedup_sync < 2:
         print("  Both scenarios show similar speed — data is likely cached in RAM.")
-        print("  The difference appears on cold storage (HDD, NFS, S3).")
-    print(f"{'═' * 55}")
+        print("  Re-run without --no-cache-purge to see cold-storage differences.")
+    print(f"{'═' * 60}")
 
     if not args.keep_data:
         cleanup_data(args.data_dir)
