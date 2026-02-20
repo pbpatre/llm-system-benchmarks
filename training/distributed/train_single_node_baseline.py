@@ -41,6 +41,7 @@ class TrainingConfig:
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     dtype: torch.dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float32
     use_compile: bool = False     # torch.compile for kernel fusion speedup
+    num_workers: int = 4          # DataLoader workers
 
     # Logging & Checkpointing
     log_every: int = 10           # Log metrics every N steps
@@ -55,6 +56,13 @@ def set_seed(seed: int):
     torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
+
+
+def configure_tf32():
+    """Enable TF32 on Ampere+ GPUs for ~2-3x faster matmuls with negligible accuracy impact."""
+    if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 8:
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
 
 
 # --- 1. Learning Rate Schedule (Warmup + Cosine Decay) ---
@@ -194,12 +202,14 @@ def save_checkpoint(model, optimizer, scheduler, step, cfg: TrainingConfig):
 def main():
     config = TrainingConfig()
 
-    # Reproducibility
     set_seed(config.seed)
+    configure_tf32()
 
     print(f"Device: {config.device}")
     print(f"Precision: {config.dtype}")
     print(f"Compile: {config.use_compile}")
+    if torch.cuda.is_available() and torch.backends.cuda.matmul.allow_tf32:
+        print(f"TF32:   enabled (Ampere+ GPU detected)")
 
     # 1. Init Data
     if config.use_synthetic:
@@ -212,14 +222,13 @@ def main():
             tokenizer_name=config.tokenizer_name,
             seq_len=config.seq_len,
         )
-    # pin_memory=True: Page-locked memory for fast CPU->GPU DMA transfer
-    # shuffle=True: randomize chunk order each epoch (critical for real data)
     dataloader = DataLoader(
         dataset,
         batch_size=config.batch_size,
         shuffle=not config.use_synthetic,
-        num_workers=4,
+        num_workers=config.num_workers,
         pin_memory=True,
+        persistent_workers=config.num_workers > 0,
     )
 
     # 2. Init Model
@@ -250,84 +259,80 @@ def main():
 
     step = 0
     total_tokens = 0
+    accum_loss = 0.0
     tokens_per_step = config.batch_size * config.seq_len * config.grad_accum_steps
 
-    # Synchronize GPU before starting the timer for accurate measurement
     if config.device == "cuda":
         torch.cuda.synchronize()
     t0 = time.time()
 
     print("Starting Training Loop...")
 
-    for batch_idx, (x, y) in enumerate(dataloader):
-        # Move data to VRAM (PCIe DMA transfer, non_blocking requires pin_memory)
-        x = x.to(config.device, non_blocking=True)
-        y = y.to(config.device, non_blocking=True)
+    while step < config.max_steps:
+        for batch_idx, (x, y) in enumerate(dataloader):
+            x = x.to(config.device, non_blocking=True)
+            y = y.to(config.device, non_blocking=True)
 
-        # A. Forward Pass — autocast handles BF16 <-> FP32 precision switching
-        with torch.autocast(device_type="cuda", dtype=config.dtype):
-            outputs = model(x, labels=y)
-            loss = outputs.loss / config.grad_accum_steps
+            # A. Forward Pass
+            with torch.autocast(device_type=config.device, dtype=config.dtype):
+                outputs = model(x, labels=y)
+                loss = outputs.loss / config.grad_accum_steps
 
-        # B. Backward Pass — traverse graph in reverse, compute gradients
-        loss.backward()
+            # B. Backward Pass
+            loss.backward()
 
-        # C. Optimizer Step — update weights when accumulation window completes
-        if (batch_idx + 1) % config.grad_accum_steps == 0:
-            # Clip gradients to prevent exploding gradients (common in Transformers)
-            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), config.max_grad_norm)
+            accum_loss += loss.detach()
 
-            optimizer.step()
-            scheduler.step()  # Update learning rate
+            # C. Optimizer Step — update weights when accumulation window completes
+            if (batch_idx + 1) % config.grad_accum_steps == 0:
+                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), config.max_grad_norm)
 
-            # set_to_none=True: free gradient memory immediately instead of zeroing
-            optimizer.zero_grad(set_to_none=True)
+                optimizer.step()
+                scheduler.step()
+                optimizer.zero_grad(set_to_none=True)
 
-            step += 1
-            total_tokens += tokens_per_step
+                step += 1
+                total_tokens += tokens_per_step
 
-            # --- Instrumentation ---
-            if step % config.log_every == 0:
-                # CUDA ops are async — must synchronize before timing
-                if config.device == "cuda":
-                    torch.cuda.synchronize()
-                t1 = time.time()
-                dt = t1 - t0
+                # --- Instrumentation ---
+                if step % config.log_every == 0:
+                    if config.device == "cuda":
+                        torch.cuda.synchronize()
+                    t1 = time.time()
+                    dt = t1 - t0
 
-                tokens_in_window = tokens_per_step * config.log_every
-                tps = tokens_in_window / dt
-                true_loss = loss.item() * config.grad_accum_steps
-                current_lr = scheduler.get_last_lr()[0]
+                    tokens_in_window = tokens_per_step * config.log_every
+                    tps = tokens_in_window / dt
+                    true_loss = accum_loss.item()
+                    current_lr = scheduler.get_last_lr()[0]
 
-                # Console
-                print(
-                    f"Step {step:>4d} | "
-                    f"Loss: {true_loss:.4f} | "
-                    f"LR: {current_lr:.2e} | "
-                    f"Grad Norm: {grad_norm:.2f} | "
-                    f"TPS: {tps:,.0f} | "
-                    f"Tokens: {total_tokens:,}"
-                )
+                    print(
+                        f"Step {step:>4d} | "
+                        f"Loss: {true_loss:.4f} | "
+                        f"LR: {current_lr:.2e} | "
+                        f"Grad Norm: {grad_norm:.2f} | "
+                        f"TPS: {tps:,.0f} | "
+                        f"Tokens: {total_tokens:,}"
+                    )
 
-                # TensorBoard
-                writer.add_scalar("Train/Loss", true_loss, step)
-                writer.add_scalar("Train/TokensPerSec", tps, step)
-                writer.add_scalar("Train/LearningRate", current_lr, step)
-                writer.add_scalar("Train/GradNorm", grad_norm, step)
+                    writer.add_scalar("Train/Loss", true_loss, step)
+                    writer.add_scalar("Train/TokensPerSec", tps, step)
+                    writer.add_scalar("Train/LearningRate", current_lr, step)
+                    writer.add_scalar("Train/GradNorm", grad_norm, step)
 
-                # GPU Memory — the metrics your pipeline analysis says to watch
-                if config.device == "cuda":
-                    mem_alloc = torch.cuda.max_memory_allocated() / (1024 ** 3)
-                    mem_reserved = torch.cuda.memory_reserved() / (1024 ** 3)
-                    writer.add_scalar("System/GPU_Memory_Allocated_GB", mem_alloc, step)
-                    writer.add_scalar("System/GPU_Memory_Reserved_GB", mem_reserved, step)
+                    if config.device == "cuda":
+                        mem_alloc = torch.cuda.max_memory_allocated() / (1024 ** 3)
+                        mem_reserved = torch.cuda.memory_reserved() / (1024 ** 3)
+                        writer.add_scalar("System/GPU_Memory_Allocated_GB", mem_alloc, step)
+                        writer.add_scalar("System/GPU_Memory_Reserved_GB", mem_reserved, step)
 
-                t0 = time.time()
+                    t0 = time.time()
 
-            # Save checkpoint at the end of training
-            if step >= config.max_steps:
-                save_checkpoint(model, optimizer, scheduler, step, config)
-                break
+                accum_loss = 0.0
+
+                if step >= config.max_steps:
+                    save_checkpoint(model, optimizer, scheduler, step, config)
+                    break
 
     writer.close()
 

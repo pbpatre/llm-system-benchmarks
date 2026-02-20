@@ -16,6 +16,7 @@ LLM inference systems involve multiple stages—preprocessing, model execution, 
 | Suite | Description | Documentation |
 |-------|-------------|---------------|
 | [Preprocessing](preprocessing/) | Analyzes preprocessing bottlenecks (Jinja2 templating vs BPE tokenization) | [README](preprocessing/benchmarks/README.md) |
+| [Training Profiling](training/) | Communication profiling for distributed training (FSDP/DDP, NVLink vs PCIe) | [PROFILING_GUIDE](training/PROFILING_GUIDE.md) |
 
 ## Installation
 
@@ -38,6 +39,8 @@ uv sync --dev
 
 ## Quick Start
 
+### Preprocessing Benchmarks
+
 ```bash
 # Run preprocessing benchmarks (quick mode, ~5 min)
 uv run python -m preprocessing.benchmarks.run --quick
@@ -48,6 +51,21 @@ uv run python -m preprocessing.benchmarks.run
 # Run specific experiments
 uv run python -m preprocessing.benchmarks.run --exp 1 3
 ```
+
+### Communication Profiling (Multi-GPU)
+
+```bash
+# Run both NVLink and PCIe experiments
+bash training/distributed/run_profiling_experiments.sh fsdp
+
+# Analyze results
+python training/analysis/profile_trace_analyzer.py
+
+# View traces in TensorBoard
+tensorboard --logdir=./output/profiling_traces
+```
+
+See [PROFILING_GUIDE.md](training/PROFILING_GUIDE.md) for detailed instructions.
 
 ## Requirements
 
@@ -64,19 +82,41 @@ export HF_TOKEN="your_token_here"
 
 ```
 llm-system-benchmarks/
-├── README.md                 # This file
-├── pyproject.toml            # Project configuration and dependencies
-├── main.py                   # Main entry point
+├── README.md                    # This file
+├── pyproject.toml               # Project configuration and dependencies
+├── main.py                      # Main entry point
 │
-├── preprocessing/            # Preprocessing benchmarks
+├── preprocessing/               # Preprocessing benchmarks
 │   └── benchmarks/
-│       ├── common/           # Shared utilities
-│       ├── experiments/      # Individual experiments
-│       ├── visualization/    # Plotting functions
-│       ├── run.py            # CLI runner
-│       └── suite.py          # Benchmark orchestrator
+│       ├── common/              # Shared utilities
+│       ├── experiments/         # Individual experiments
+│       ├── visualization/       # Plotting functions
+│       ├── run.py               # CLI runner
+│       └── suite.py             # Benchmark orchestrator
 │
-└── results.csv               # Example benchmark results
+├── training/                    # Distributed training profiling
+│   ├── README.md                # Training suite documentation
+│   ├── distributed/             # Main distributed training scripts
+│   │   ├── profile_distributed.py       # FSDP/DDP profiling script
+│   │   ├── train_distributed_node.py    # Multi-node training runner
+│   │   ├── train_single_node_baseline.py # Single-node baseline
+│   │   ├── ddp_fsdp_oom_demo.py         # OOM demo with checkpointing
+│   │   └── run_profiling_experiments.sh # Automated experiment runner
+│   ├── analysis/                # Trace analysis tools
+│   │   ├── profile_trace_analyzer.py    # PyTorch profiler analyzer
+│   │   ├── dataloader_bottleneck_simulation.py
+│   │   ├── padding_tax_simulation.py
+│   │   ├── random_vs_seq_dataloader_simulation.py
+│   │   └── ...                  # Other analysis scripts
+│   └── helper/                  # Utility modules
+│       ├── profiler_analyzer.py # FSDP overlap metrics
+│       ├── check_gpu_info.py    # GPU information
+│       └── fsdp_ddp_comparison_demo.py
+│
+└── output/                      # All generated outputs (gitignored)
+    ├── README.md                # Output directory structure
+    ├── profiling_traces/        # PyTorch profiler traces
+    └── communication_analysis.md # Generated comparison tables
 ```
 
 ## Adding New Benchmark Suites

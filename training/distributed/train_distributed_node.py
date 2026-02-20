@@ -2,6 +2,8 @@ import os
 import time
 import math
 import functools
+from contextlib import nullcontext
+from datetime import timedelta
 import torch
 import torch.nn as nn
 import torch.distributed as dist
@@ -10,7 +12,7 @@ from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-from torch.distributed.fsdp import StateDictType, FullStateDictConfig
+from torch.distributed.fsdp import StateDictType, FullStateDictConfig, MixedPrecision
 from torch.distributed.fsdp.wrap import size_based_auto_wrap_policy
 from transformers import GPT2Config, GPT2LMHeadModel, AutoTokenizer
 from torch.utils.tensorboard import SummaryWriter
@@ -33,7 +35,7 @@ class TrainingConfig:
     dataset_name: str = "wikitext"               # HuggingFace dataset name
     dataset_config: str = "wikitext-103-raw-v1"  # Dataset subset/config
     tokenizer_name: str = "gpt2"                 # Tokenizer (must match vocab_size)
-    use_synthetic: bool = True                    # True = random tokens (GPU-only benchmarking)
+    use_synthetic: bool = False                   # True = random tokens (GPU-only benchmarking)
 
     # Optimization
     lr: float = 3e-4
@@ -47,6 +49,7 @@ class TrainingConfig:
     # Hardware
     dtype: torch.dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float32
     use_compile: bool = False     # torch.compile for kernel fusion speedup
+    num_workers: int = 2          # DataLoader workers per rank
 
     # Logging & Checkpointing
     log_every: int = 10
@@ -170,6 +173,8 @@ def setup_distributed():
     world_size = int(os.environ["WORLD_SIZE"])
     local_rank = int(os.environ["LOCAL_RANK"])
 
+    timeout = timedelta(minutes=5)
+
     if torch.cuda.is_available():
         num_gpus = torch.cuda.device_count()
         gpu_id = local_rank % num_gpus
@@ -180,16 +185,16 @@ def setup_distributed():
             # Simulation mode: more ranks than GPUs.
             # NCCL rejects duplicate GPUs, so use GLOO (CPU-based collectives).
             # Data stays on the GPU for compute; only gradient sync goes through CPU.
-            dist.init_process_group("gloo")
+            dist.init_process_group("gloo", timeout=timeout)
             if rank == 0:
                 print(f"WARNING: {world_size} ranks but only {num_gpus} GPU(s). "
                       f"Using GLOO backend (simulation mode — not for benchmarking).")
         else:
             # Real multi-GPU: each rank gets its own GPU, use NCCL for fast GPU-direct comms.
-            dist.init_process_group("nccl")
+            dist.init_process_group("nccl", timeout=timeout)
     else:
         device = torch.device("cpu")
-        dist.init_process_group("gloo")
+        dist.init_process_group("gloo", timeout=timeout)
 
     return rank, world_size, local_rank, device
 
@@ -198,7 +203,7 @@ def cleanup():
     dist.destroy_process_group()
 
 
-def get_dist_dataloader(dataset, batch_size, rank, world_size):
+def get_dist_dataloader(dataset, batch_size, rank, world_size, num_workers: int = 2):
     """
     Shards data across ranks so each GPU trains on different samples.
     Rank 0 sees indices [0, 2, 4, ...], Rank 1 sees [1, 3, 5, ...], etc.
@@ -209,8 +214,9 @@ def get_dist_dataloader(dataset, batch_size, rank, world_size):
     )
     loader = DataLoader(
         dataset, batch_size=batch_size,
-        pin_memory=True, num_workers=2,
-        sampler=sampler,  # Sampler handles shuffling, not DataLoader
+        pin_memory=True, num_workers=num_workers,
+        persistent_workers=num_workers > 0,
+        sampler=sampler,
     )
     return loader, sampler
 
@@ -221,27 +227,28 @@ def save_distributed_checkpoint(model, optimizer, scheduler, step, config, rank,
     DDP has the full model on every rank, so only rank 0 saves.
     """
     if use_fsdp:
-        # FSDP: gather full state dict to rank 0
         full_state_cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
         with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, full_state_cfg):
             model_state = model.state_dict()
+            optim_state = FSDP.optim_state_dict(model, optimizer)
             if rank == 0:
                 os.makedirs(config.checkpoint_dir, exist_ok=True)
                 path = os.path.join(config.checkpoint_dir, f"step_{step}_fsdp.pt")
                 torch.save({
                     "step": step,
                     "model_state_dict": model_state,
+                    "optimizer_state_dict": optim_state,
+                    "scheduler_state_dict": scheduler.state_dict(),
                     "config": config,
                 }, path)
                 print(f"  [Rank 0] FSDP checkpoint saved: {path}")
     else:
-        # DDP: full model on every rank, save from rank 0 only
         if rank == 0:
             os.makedirs(config.checkpoint_dir, exist_ok=True)
             path = os.path.join(config.checkpoint_dir, f"step_{step}_ddp.pt")
             torch.save({
                 "step": step,
-                "model_state_dict": model.module.state_dict(),  # .module unwraps DDP
+                "model_state_dict": model.module.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
                 "scheduler_state_dict": scheduler.state_dict(),
                 "config": config,
@@ -290,11 +297,16 @@ def run_experiment(use_fsdp: bool):
                 seq_len=config.seq_len,
             )
 
-    dataloader, sampler = get_dist_dataloader(dataset, config.batch_size, rank, world_size)
+    dataloader, sampler = get_dist_dataloader(
+        dataset, config.batch_size, rank, world_size, num_workers=config.num_workers,
+    )
 
     # --- 2. Model ---
     model = get_model(config).to(device)
-    gpu_id = device.index  # Actual GPU id (clamped for single-GPU simulation)
+    gpu_id = device.index
+
+    if config.use_compile:
+        model = torch.compile(model)
 
     if use_fsdp:
         # FSDP: shards parameters, gradients, and optimizer states across ranks.
@@ -303,13 +315,29 @@ def run_experiment(use_fsdp: bool):
         auto_wrap_policy = functools.partial(
             size_based_auto_wrap_policy, min_num_params=20_000,
         )
+        mp_policy = None
+        if config.dtype == torch.bfloat16:
+            mp_policy = MixedPrecision(
+                param_dtype=torch.bfloat16,
+                reduce_dtype=torch.bfloat16,
+                buffer_dtype=torch.bfloat16,
+            )
+        elif config.dtype == torch.float16:
+            mp_policy = MixedPrecision(
+                param_dtype=torch.float16,
+                reduce_dtype=torch.float16,
+                buffer_dtype=torch.float16,
+            )
         model = FSDP(
             model,
             auto_wrap_policy=auto_wrap_policy,
+            mixed_precision=mp_policy,
             device_id=device,
         )
         if is_main:
             print(f"[Rank {rank}] Model wrapped in FSDP (sharded across {world_size} GPUs)")
+            if mp_policy:
+                print(f"  FSDP MixedPrecision: param={mp_policy.param_dtype}, reduce={mp_policy.reduce_dtype}")
     else:
         # DDP: replicates full model on every GPU.
         # After backward(), gradients are all-reduced (averaged) across ranks.
@@ -317,9 +345,6 @@ def run_experiment(use_fsdp: bool):
         model = DDP(model, device_ids=[gpu_id])
         if is_main:
             print(f"[Rank {rank}] Model wrapped in DDP (replicated on {world_size} GPUs)")
-
-    if config.use_compile:
-        model = torch.compile(model)
 
     n_params = sum(p.numel() for p in model.parameters())
     if is_main:
@@ -341,6 +366,7 @@ def run_experiment(use_fsdp: bool):
 
     step = 0
     total_tokens = 0
+    accum_loss = 0.0
     # Each step: batch_size * seq_len * grad_accum_steps tokens PER GPU
     # Across all GPUs: multiply by world_size for global throughput
     tokens_per_step_local = config.batch_size * config.seq_len * config.grad_accum_steps
@@ -362,13 +388,21 @@ def run_experiment(use_fsdp: bool):
             x = x.to(device, non_blocking=True)
             y = y.to(device, non_blocking=True)
 
-            # A. Forward Pass
-            with torch.autocast(device_type=device.type, dtype=config.dtype):
-                outputs = model(x, labels=y)
-                loss = outputs.loss / config.grad_accum_steps
+            # Skip gradient all-reduce on intermediate accumulation steps.
+            # Only the final micro-batch in the window needs to synchronize.
+            is_accumulating = (batch_idx + 1) % config.grad_accum_steps != 0
+            sync_context = model.no_sync() if is_accumulating else nullcontext()
 
-            # B. Backward Pass
-            loss.backward()
+            # A. Forward Pass
+            with sync_context:
+                with torch.autocast(device_type=device.type, dtype=config.dtype):
+                    outputs = model(x, labels=y)
+                    loss = outputs.loss / config.grad_accum_steps
+
+                # B. Backward Pass (all-reduce only fires on the final micro-batch)
+                loss.backward()
+
+            accum_loss += loss.detach()
 
             # C. Optimizer Step — when accumulation window completes
             if (batch_idx + 1) % config.grad_accum_steps == 0:
@@ -381,39 +415,48 @@ def run_experiment(use_fsdp: bool):
                 step += 1
                 total_tokens += tokens_per_step_global
 
-                # --- Instrumentation (rank 0 only) ---
-                if is_main and step % config.log_every == 0:
+                # All ranks participate in the memory all_reduce every log interval,
+                # then only rank 0 prints and writes to TensorBoard.
+                if step % config.log_every == 0:
                     if torch.cuda.is_available():
-                        torch.cuda.synchronize()
-                    t1 = time.time()
-                    dt = t1 - t0
+                        local_mem = torch.cuda.max_memory_allocated()
+                        mem_tensor = torch.tensor([local_mem], device=device, dtype=torch.long)
+                        dist.all_reduce(mem_tensor, op=dist.ReduceOp.MAX)
+                        peak_mem_gb = mem_tensor.item() / (1024 ** 3)
 
-                    tokens_in_window = tokens_per_step_global * config.log_every
-                    tps = tokens_in_window / dt
-                    true_loss = loss.item() * config.grad_accum_steps
-                    current_lr = scheduler.get_last_lr()[0]
+                    if is_main:
+                        if torch.cuda.is_available():
+                            torch.cuda.synchronize()
+                        t1 = time.time()
+                        dt = t1 - t0
 
-                    print(
-                        f"Step {step:>4d} | "
-                        f"Loss: {true_loss:.4f} | "
-                        f"LR: {current_lr:.2e} | "
-                        f"Grad Norm: {grad_norm:.2f} | "
-                        f"TPS: {tps:,.0f} | "
-                        f"Tokens: {total_tokens:,}"
-                    )
+                        tokens_in_window = tokens_per_step_global * config.log_every
+                        tps = tokens_in_window / dt
+                        true_loss = accum_loss.item()
+                        current_lr = scheduler.get_last_lr()[0]
 
-                    writer.add_scalar("Train/Loss", true_loss, step)
-                    writer.add_scalar("Train/TokensPerSec", tps, step)
-                    writer.add_scalar("Train/LearningRate", current_lr, step)
-                    writer.add_scalar("Train/GradNorm", grad_norm, step)
+                        print(
+                            f"Step {step:>4d} | "
+                            f"Loss: {true_loss:.4f} | "
+                            f"LR: {current_lr:.2e} | "
+                            f"Grad Norm: {grad_norm:.2f} | "
+                            f"TPS: {tps:,.0f} | "
+                            f"Tokens: {total_tokens:,}"
+                        )
 
-                    if torch.cuda.is_available():
-                        mem_alloc = torch.cuda.max_memory_allocated() / (1024 ** 3)
-                        mem_reserved = torch.cuda.memory_reserved() / (1024 ** 3)
-                        writer.add_scalar("System/GPU_Memory_Allocated_GB", mem_alloc, step)
-                        writer.add_scalar("System/GPU_Memory_Reserved_GB", mem_reserved, step)
+                        writer.add_scalar("Train/Loss", true_loss, step)
+                        writer.add_scalar("Train/TokensPerSec", tps, step)
+                        writer.add_scalar("Train/LearningRate", current_lr, step)
+                        writer.add_scalar("Train/GradNorm", grad_norm, step)
 
-                    t0 = time.time()
+                        if torch.cuda.is_available():
+                            local_reserved = torch.cuda.memory_reserved() / (1024 ** 3)
+                            writer.add_scalar("System/Peak_GPU_Memory_Allocated_GB", peak_mem_gb, step)
+                            writer.add_scalar("System/GPU_Memory_Reserved_GB_Rank0", local_reserved, step)
+
+                        t0 = time.time()
+
+                accum_loss = 0.0
 
                 # Checkpoint + exit
                 if step >= config.max_steps:
@@ -425,14 +468,19 @@ def run_experiment(use_fsdp: bool):
     if writer:
         writer.close()
 
-    # --- Final Summary (rank 0 only) ---
+    # All ranks must participate in the final all_reduce before rank 0 prints.
+    if torch.cuda.is_available():
+        local_peak = torch.cuda.max_memory_allocated()
+        peak_tensor = torch.tensor([local_peak], device=device, dtype=torch.long)
+        dist.all_reduce(peak_tensor, op=dist.ReduceOp.MAX)
+
     if is_main:
         print(f"\n--- Training Complete ({mode_name}) ---")
         print(f"  World size: {world_size}")
         print(f"  Steps completed: {step}")
         print(f"  Total tokens processed (all GPUs): {total_tokens:,}")
         if torch.cuda.is_available():
-            print(f"  Peak GPU memory allocated (rank 0): {torch.cuda.max_memory_allocated() / (1024**3):.2f} GB")
+            print(f"  Peak GPU memory allocated (max across ranks): {peak_tensor.item() / (1024**3):.2f} GB")
             print(f"  GPU memory reserved (rank 0): {torch.cuda.memory_reserved() / (1024**3):.2f} GB")
 
     cleanup()
@@ -441,7 +489,7 @@ def run_experiment(use_fsdp: bool):
 if __name__ == "__main__":
     import sys
 
-    # Usage: torchrun --nproc_per_node=2 train_distributed_node.py --mode=fsdp
-    #        torchrun --nproc_per_node=2 train_distributed_node.py --mode=ddp
+    # Usage: in 
+    #        torchrun --nproc-per-node=2 train_distributed_node.py --mode=ddp
     use_fsdp = "--mode=fsdp" in sys.argv
     run_experiment(use_fsdp=use_fsdp)
