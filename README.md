@@ -16,6 +16,7 @@ LLM inference systems involve multiple stages—preprocessing, model execution, 
 | Suite | Description | Documentation |
 |-------|-------------|---------------|
 | [Preprocessing](preprocessing/) | Analyzes preprocessing bottlenecks (Jinja2 templating vs BPE tokenization) | [README](preprocessing/benchmarks/README.md) |
+| [Inference](inference/) | vLLM serving benchmarks — head-of-line blocking, chunked prefill, ITL latency | [README](inference/README.md) |
 
 ## Installation
 
@@ -75,6 +76,12 @@ llm-system-benchmarks/
 │       ├── visualization/    # Plotting functions
 │       ├── run.py            # CLI runner
 │       └── suite.py          # Benchmark orchestrator
+│
+├── inference/                # Inference serving benchmarks (isolated venv)
+│   ├── README.md             # Setup guide and benchmark docs
+│   ├── prefill_blocking_bench.py   # HOL blocking: naive vs. chunked prefill
+│   ├── run_prefill_blocking_bench.sh  # Orchestrator (runs both passes)
+│   └── setup_inference_env.sh      # Creates inference/.venv/
 │
 └── results.csv               # Example benchmark results
 ```

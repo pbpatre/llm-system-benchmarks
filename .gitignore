@@ -1,6 +1,12 @@
 # Benchmark outputs (regenerate with: uv run python -m preprocessing.benchmarks.run)
 output/
 
+# Inference benchmark results (generated CSVs)
+results/
+
+# Inference isolated venv (created by inference/setup_inference_env.sh)
+inference/.venv/
+
 # macOS
 .DS_Store
 
