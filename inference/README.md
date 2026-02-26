@@ -54,6 +54,84 @@ results/naive.csv    # --no-chunked-prefill pass
 results/chunked.csv  # --chunked-prefill pass
 ```
 
+### Continuous Batching vs. Static Batching
+
+`continuous_batching_bench.py` quantifies the "Effective Throughput" gain of
+iteration-level scheduling (continuous batching) by measuring the tensor
+occupancy padding waste inherent in static batching.
+
+In static batching, every request in a batch must stay in flight until the
+longest "straggler" finishes. This forces the GPU to perform matrix
+multiplications on tensor padding for the slots that finished early. vLLM's
+continuous batching allows finished requests to exit and new ones to enter at
+every iteration, maximizing functional GPU occupancy.
+
+**Workload:**
+
+- 100 requests total
+- Input Length: Fixed at 128 tokens
+- Output Lengths: 50% "Short" (32 tokens) + 50% "Long" (512 tokens)
+- Requests are shuffled so Short and Long are randomly mixed
+
+**Run A (Static Batching Simulation):**
+
+Process the 100 requests in fixed batches of size 16. For each batch, identify
+the max output length and force every request in that batch to generate exactly
+that many tokens (using `min_tokens`, `max_tokens`, and `ignore_eos=True`).
+This simulates the synchronous waste of a static batching system where all
+requests must wait for the slowest one.
+
+**Run B (Continuous Batching):**
+
+Submit all 100 requests simultaneously and let vLLM handle the scheduling
+naturally (`ignore_eos=False`). Requests exit as soon as they finish; new ones
+fill vacated slots instantly.
+
+**Metrics captured:**
+
+| Metric | Description |
+|--------|-------------|
+| Total wall-clock time | End-to-end time for all requests |
+| Total useful tokens | Sum of actual output lengths (excludes padding) |
+| Useful TPS | Economic throughput: useful tokens / wall-clock time |
+| Throughput gain | Percentage improvement in useful TPS |
+| Speedup factor | Continuous TPS / Static TPS |
+
+#### Running the benchmark
+
+```bash
+# Run both static and continuous batching
+python continuous_batching_bench.py
+
+# Run only static batching (Run A)
+python continuous_batching_bench.py --static-only
+
+# Run only continuous batching (Run B)
+python continuous_batching_bench.py --continuous-only
+
+# Print summary from previously saved results
+python continuous_batching_bench.py --summary
+```
+
+Optional flags:
+
+```
+--model <hf_model_id>   Model to serve (default: meta-llama/Llama-3.1-8B-Instruct)
+--output-dir <path>     Directory for JSON output / summary input (default: results/)
+```
+
+To run both passes and print the comparison in one step:
+
+```bash
+./run_continuous_batching_bench.sh [--model <model_id>]
+```
+
+Results are written to:
+
+```
+results/continuous_batching_summary.json  # Full summary with both runs
+```
+
 ---
 
 ## Environment Setup
