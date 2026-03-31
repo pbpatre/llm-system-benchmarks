@@ -1,5 +1,10 @@
 # Benchmark outputs (regenerate with: uv run python -m preprocessing.benchmarks.run)
 output/
+!output/README.md
+
+# Training outputs
+checkpoints/
+runs/
 
 # macOS
 .DS_Store
