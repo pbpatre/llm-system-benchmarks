@@ -1,0 +1,67 @@
+# ==============================================================================
+# llama_vllm_shim/config.pbtxt
+#
+# Python Backend – GGUF LLM inference via llama-cpp-python.
+#
+# Current mode: llama_cpp (CPU inside Docker container).
+# The Linux container cannot access Apple Metal — llama-cpp-python runs on
+# CPU only here.  This is sufficient for integration/plumbing testing.
+#
+# backend_mode options (set via parameters below):
+#   "dummy"     - echo token count, no model needed (fastest plumbing test)
+#   "llama_cpp" - load GGUF and run CPU inference (current)
+#
+# L40S cluster migration:
+#   Replace this entire directory with the official Triton vLLM backend.
+#   The ensemble_model/config.pbtxt stays identical (same tensor names).
+#   instance_group → KIND_GPU, gpu: [0], count: 1
+#
+# Dynamic Batching:
+#   Enabled here (not on preprocess/postprocess) because this is the
+#   compute bottleneck.  preferred_batch_size communicates optimal batch
+#   sizes to the ensemble scheduler.
+# ==============================================================================
+
+name: "llama_vllm_shim"
+backend: "python"
+max_batch_size: 32
+
+input [
+  {
+    name: "input_ids"
+    data_type: TYPE_INT32
+    dims: [ -1 ]
+  }
+]
+
+output [
+  {
+    name: "text_output"
+    data_type: TYPE_STRING
+    dims: [ 1 ]
+  }
+]
+
+# On L40S: replace with KIND_GPU, gpu: [0], count: 1
+instance_group [
+  {
+    kind: KIND_CPU
+    count: 1
+  }
+]
+
+dynamic_batching {
+  preferred_batch_size: [ 1, 4, 8 ]
+  max_queue_delay_microseconds: 5000
+}
+
+# Parameters forwarded to model.py initialize().
+# No inline comments inside parameter blocks (protobuf parser limitation).
+# model_path: GGUF path inside container via -v $(pwd)/inference/models/gguf:/weights
+# n_gpu_layers: 0 = CPU only (no Metal in Linux container).
+# tokenizer_name: used to decode output token ids back to text.
+parameters { key: "backend_mode"   value { string_value: "llama_cpp" } }
+parameters { key: "model_path"     value { string_value: "/weights/llama-3.2-1b/Llama-3.2-1B-Instruct-Q4_K_M.gguf" } }
+parameters { key: "n_gpu_layers"   value { string_value: "0" } }
+parameters { key: "max_new_tokens" value { string_value: "128" } }
+parameters { key: "tokenizer_name" value { string_value: "/models/preprocess/tokenizer" } }

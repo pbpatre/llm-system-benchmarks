@@ -6,6 +6,11 @@ output/
 checkpoints/
 runs/
 
+# LLM model weights — too large for git (GGUFs, safetensors, etc.)
+# Download with: huggingface-cli download ... --local-dir inference/models/gguf/<model>/
+inference/models/
+!inference/models/.gitkeep
+
 # macOS
 .DS_Store
 

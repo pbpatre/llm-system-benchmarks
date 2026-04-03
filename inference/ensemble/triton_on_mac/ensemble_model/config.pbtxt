@@ -1,0 +1,98 @@
+# ==============================================================================
+# ensemble_model/config.pbtxt
+#
+# Triton Ensemble – chains preprocess → llama_vllm_shim.
+#
+# The ensemble platform has NO executable code; it is pure config.
+# Triton's ensemble scheduler:
+#   1. Receives a client request with tensor "PROMPT".
+#   2. Fans it to "preprocess" as "TEXT".
+#   3. Takes the "INPUT_IDS" output and passes it to "llama_vllm_shim"
+#      as "input_ids" via shared memory (transparent to this config).
+#   4. Returns "text_output" from the shim back to the client as
+#      "GENERATED_TEXT".
+#
+# Dynamic Batching at the Ensemble level
+# ----------------------------------------
+# The ensemble itself does NOT support dynamic_batching {} stanzas – that
+# config lives on the leaf models.  Instead, set preferred_batch_size on
+# llama_vllm_shim (the bottleneck) to control how requests are fused before
+# reaching the GPU.  The ensemble scheduler propagates the fused batch
+# through the entire pipeline transparently.
+#
+# Shared Memory between steps
+# ----------------------------
+# When both leaf models are Python backends, Triton uses POSIX SHM to pass
+# intermediate tensors (here: "intermediate_ids" / INPUT_IDS INT32) between
+# the preprocess subprocess and the llama_vllm_shim subprocess.
+#
+# Size budget for the SHM region (launch flag):
+#   --backend-config=python,shm-default-byte-size=<bytes>
+#
+# For batch=128, seq_len=4096, INT32 (4 bytes):
+#   128 * 4096 * 4 = 2 097 152 bytes (2 MiB)
+# Add headroom → use 4 MiB:
+#   --backend-config=python,shm-default-byte-size=4194304
+#
+# Recommended tritonserver launch command (local M3 testing):
+# -----------------------------------------------------------
+#   docker run --rm -it \
+#     -v $(pwd)/inference/ensemble/triton_on_mac:/models \
+#     -p 8000:8000 -p 8001:8001 -p 8002:8002 \
+#     nvcr.io/nvidia/tritonserver:24.08-py3 \
+#       tritonserver \
+#         --model-repository=/models \
+#         --backend-config=python,shm-default-byte-size=4194304 \
+#         --log-verbose=1
+# ==============================================================================
+
+name: "ensemble_model"
+platform: "ensemble"
+# Must be <= min(max_batch_size of all leaf models).
+# preprocess=32, llama_vllm_shim=32, so ensemble max is also 32.
+max_batch_size: 32
+
+# ---- Client-facing input ----
+input [
+  {
+    name: "PROMPT"
+    data_type: TYPE_STRING
+    dims: [ 1 ]
+  }
+]
+
+# ---- Client-facing output ----
+output [
+  {
+    name: "GENERATED_TEXT"
+    data_type: TYPE_STRING
+    dims: [ 1 ]
+  }
+]
+
+# ---- Pipeline definition ----
+ensemble_scheduling {
+  step [
+    {
+      # Step 1: tokenise — TEXT → INPUT_IDS (via SHM)
+      model_name: "preprocess"
+      model_version: -1
+      input_map  { key: "TEXT",      value: "PROMPT" }
+      output_map { key: "INPUT_IDS", value: "intermediate_ids" }
+    },
+    {
+      # Step 2: generate — INPUT_IDS → raw text (via SHM)
+      model_name: "llama_vllm_shim"
+      model_version: -1
+      input_map  { key: "input_ids",   value: "intermediate_ids" }
+      output_map { key: "text_output", value: "raw_output" }
+    },
+    {
+      # Step 3: clean — strip role headers, stop tokens, whitespace
+      model_name: "postprocess"
+      model_version: -1
+      input_map  { key: "RAW_OUTPUT",     value: "raw_output" }
+      output_map { key: "GENERATED_TEXT", value: "GENERATED_TEXT" }
+    }
+  ]
+}

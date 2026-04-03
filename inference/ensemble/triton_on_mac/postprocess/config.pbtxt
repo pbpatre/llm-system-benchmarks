@@ -1,0 +1,51 @@
+# ==============================================================================
+# postprocess/config.pbtxt
+#
+# Python Backend – output cleaning and formatting.
+#
+# Responsibilities:
+#   1. Strip Llama-3 role headers ("assistant\n\n", "<|...|>" tokens).
+#   2. Strip leading/trailing whitespace.
+#   3. Optionally truncate at stop strings (e.g. "<|eot_id|>").
+#
+# Position in ensemble:
+#   preprocess → llama_vllm_shim → postprocess (this model) → client
+#
+# No dynamic batching here — the ensemble scheduler drives batching.
+# instance_group count: 2 matches preprocess so the pipeline is balanced.
+# ==============================================================================
+
+name: "postprocess"
+backend: "python"
+max_batch_size: 32
+
+input [
+  {
+    name: "RAW_OUTPUT"
+    data_type: TYPE_STRING
+    dims: [ 1 ]
+  }
+]
+
+output [
+  {
+    name: "GENERATED_TEXT"
+    data_type: TYPE_STRING
+    dims: [ 1 ]
+  }
+]
+
+instance_group [
+  {
+    kind: KIND_CPU
+    count: 2
+  }
+]
+
+# Stop strings: comma-separated list of strings at which to truncate output.
+# Llama-3 uses <|eot_id|> as end-of-turn marker.
+parameters { key: "stop_strings"       value { string_value: "<|eot_id|>,<|end_of_text|>" } }
+
+# Strip the role header that Llama-3 prefixes to assistant turns.
+# "assistant\n\n" is the decoded form of the chat-template header tokens.
+parameters { key: "strip_role_header"  value { string_value: "true" } }

@@ -1,0 +1,63 @@
+# ==============================================================================
+# preprocess/config.pbtxt
+#
+# Python Backend: AutoTokenizer.apply_chat_template() + encode().
+#
+# instance_group spawns N independent Python subprocesses (one GIL each),
+# so CPU-bound tokenisation scales horizontally.
+#
+# Dynamic Batching is intentionally omitted here – the Ensemble scheduler
+# drives batching.  Enabling it on a leaf inside an ensemble causes
+# request-count mismatches.
+# ==============================================================================
+
+name: "preprocess"
+backend: "python"
+
+# Must be <= the smallest max_batch_size of any leaf model AND the ensemble.
+# llama_vllm_shim is capped at 32, so we match that here.
+max_batch_size: 32
+
+input [
+  {
+    name: "TEXT"
+    data_type: TYPE_STRING
+    dims: [ 1 ]
+  }
+]
+
+output [
+  {
+    name: "INPUT_IDS"
+    data_type: TYPE_INT32
+    dims: [ -1 ]
+  }
+]
+
+instance_group [
+  {
+    kind: KIND_CPU
+    count: 2
+  }
+]
+
+# ---------------------------------------------------------------------------
+# Parameters forwarded to model.py initialize().
+# IMPORTANT: do NOT put comments inside parameter blocks – the protobuf
+# text-format parser treats inline comments as syntax errors in some Triton
+# builds.  Put all explanatory comments outside the block as shown here.
+# ---------------------------------------------------------------------------
+
+# model_name: path visible INSIDE the container.
+# The volume mount -v $(pwd)/triton_on_mac:/models makes the host directory
+# inference/ensemble/triton_on_mac/preprocess/tokenizer/ available at
+# /models/preprocess/tokenizer/ inside the container.
+# Run scripts/save_tokenizer.py on the host once to populate it.
+parameters { key: "model_name"          value { string_value: "/models/preprocess/tokenizer" } }
+
+# fallback_model_name: used when model_name path does not exist.
+# Llama-3.2-1B-Instruct is public (not gated), no HF token needed.
+# Shares the same tokenizer/vocab as Llama-3.1-8B so no tokenizer swap needed.
+parameters { key: "fallback_model_name" value { string_value: "meta-llama/Llama-3.2-1B-Instruct" } }
+
+parameters { key: "max_length"          value { string_value: "4096" } }
